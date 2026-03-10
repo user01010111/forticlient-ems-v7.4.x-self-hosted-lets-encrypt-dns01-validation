@@ -1,0 +1,4 @@
+# Cloudflare API token with:
+# - Zone:DNS:Edit
+# - Zone:Zone:Read
+dns_cloudflare_api_token = REPLACE_ME
