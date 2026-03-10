@@ -5,6 +5,7 @@ DOMAIN=""
 EMAIL=""
 CF_CREDS="/root/.secrets/certbot/cloudflare.ini"
 DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/fcems-cert-deploy.sh"
+EMS_REFRESH="/usr/local/sbin/fcems-ems-refresh.sh"
 WRAPPER="/usr/local/sbin/fcems-certbot.sh"
 
 usage() {
@@ -74,8 +75,9 @@ if [[ ! -s "\$SRC_CERT" || ! -s "\$SRC_KEY" ]]; then
   exit 1
 fi
 
+# Defensive safeguard: never publish a non-production cert into EMS.
 if openssl x509 -in "\$SRC_CERT" -noout -issuer | grep -q '(STAGING)'; then
-  log "refusing to deploy Let's Encrypt staging certificate from \$LIVE_DIR"
+  log "refusing to deploy non-production certificate from \$LIVE_DIR"
   exit 0
 fi
 
@@ -96,6 +98,32 @@ log "deployed renewed certificate from \$LIVE_DIR into EMS and reloaded apache2"
 EOF
 chmod 755 "$DEPLOY_HOOK"
 
+cat > "$EMS_REFRESH" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+services=$(systemctl list-unit-files 'fcems_*.service' --state=enabled --no-legend | awk '{print $1}')
+
+if [[ -z "$services" ]]; then
+  echo "no enabled EMS services found" >&2
+  exit 1
+fi
+
+systemctl restart $services
+
+# Let the restart burst complete before any cert deployment happens.
+sleep 45
+
+for _ in $(seq 1 18); do
+  if ps -eo etimes,cmd | awk '/fcems_|apache2 -k start/ && !/awk/ { if ($1 < 20) found=1 } END { exit found ? 0 : 1 }'; then
+    sleep 10
+  else
+    break
+  fi
+done
+EOF
+chmod 755 "$EMS_REFRESH"
+
 cat > "$WRAPPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -104,14 +132,16 @@ DOMAIN="$DOMAIN"
 EMAIL="$EMAIL"
 CF_CREDS="$CF_CREDS"
 DEPLOY_HOOK="$DEPLOY_HOOK"
+EMS_REFRESH="$EMS_REFRESH"
 
 usage() {
   cat <<'EOS'
 Usage:
   fcems-certbot.sh issue
-  fcems-certbot.sh renew-dry-run
+  fcems-certbot.sh renew
   fcems-certbot.sh deploy-now
-  fcems-certbot.sh issue-staging-no-deploy
+  fcems-certbot.sh restart-ems-then-deploy
+  fcems-certbot.sh verify
 EOS
 }
 
@@ -141,25 +171,26 @@ case "\$cmd" in
       --cert-name "\$DOMAIN" \\
       -d "\$DOMAIN"
     ;;
-  renew-dry-run)
+  renew)
     require_token
-    exec certbot renew --dry-run --run-deploy-hooks
+    exec certbot renew
     ;;
   deploy-now)
     exec "\$DEPLOY_HOOK"
     ;;
-  issue-staging-no-deploy)
-    require_token
-    exec certbot certonly \\
-      --staging \\
-      --non-interactive \\
-      --agree-tos \\
-      --email "\$EMAIL" \\
-      --dns-cloudflare \\
-      --dns-cloudflare-credentials "\$CF_CREDS" \\
-      --dns-cloudflare-propagation-seconds 60 \\
-      --cert-name "\$DOMAIN-staging-test" \\
-      -d "\$DOMAIN"
+  restart-ems-then-deploy)
+    "\$EMS_REFRESH"
+    exec "\$DEPLOY_HOOK"
+    ;;
+  verify)
+    echo "LIVE443"
+    echo | openssl s_client -connect "\$DOMAIN:443" -servername "\$DOMAIN" 2>/dev/null | openssl x509 -noout -subject -issuer -dates -serial
+    echo "---"
+    echo "LIVE10443"
+    echo | openssl s_client -connect 127.0.0.1:10443 -servername "\$DOMAIN" 2>/dev/null | openssl x509 -noout -subject -issuer -dates -serial
+    echo "---"
+    echo "EMS_FILE"
+    openssl x509 -in "/opt/forticlientems/data/certs/\$DOMAIN.crt" -noout -subject -issuer -dates -serial
     ;;
   *)
     usage
@@ -177,5 +208,5 @@ Setup complete.
 Next steps:
   1. sudoedit $CF_CREDS
   2. sudo $WRAPPER issue
-  3. sudo $WRAPPER renew-dry-run
+  3. sudo $WRAPPER verify
 EOF

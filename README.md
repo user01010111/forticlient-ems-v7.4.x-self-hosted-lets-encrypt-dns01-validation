@@ -1,158 +1,214 @@
-# FortiClient-EMS v7.4.x - Self Hosted - Let's Encrypt DNS01 Validation
+# FortiClient-EMS v7.4.x Self-Hosted Let's Encrypt DNS-01
 
-Automates Let's Encrypt DNS-01 certificate issuance and renewal for self-hosted FortiClient EMS v7.4.x on Ubuntu 24.04, using Cloudflare DNS.
+Operational runbook and automation for FortiClient EMS v7.4.x on Ubuntu 24.04 where inbound HTTP validation is not allowed.
 
-This avoids inbound HTTP ACME validation entirely. Certbot obtains the certificate through DNS-01, then deploys the renewed certificate into the EMS certificate path used by Apache on ports `443` and `10443`.
+This solution uses:
 
-## What This Solves
+- Let's Encrypt DNS-01
+- Cloudflare DNS API
+- Certbot on the EMS host
+- final certificate deployment into the EMS Apache certificate path
 
-- EMS built-in ACME renewal depends on HTTP validation.
-- Some deployments do not allow inbound internet access to EMS.
-- DNS-01 validation removes the need to expose `80/443` publicly.
+## Executive Summary
 
-## Known Caveat
+FortiClient EMS can use a Let's Encrypt certificate for the GUI and endpoint-control traffic, but its built-in ACME flow expects inbound HTTP validation.
 
-EMS can continue showing a stale warning in the GUI even when the live certificate presented by Apache has already been updated.
+This project replaces that with a DNS-01 flow and a tested deployment sequence.
 
-That warning appears to be EMS metadata/UI state, not the active TLS certificate. In practice:
+Verified on a live EMS host:
 
-- `apache2` serves the live cert for GUI/API traffic.
-- EMS may not refresh the certificate warning immediately from filesystem changes.
-- Reloading or restarting EMS-related services may clear the GUI warning, but this is typically aesthetic only if the live cert is already correct.
+- Apache is the real TLS frontend on `443` and `10443`
+- the live certificate files are:
+  - `/opt/forticlientems/data/certs/<domain>.crt`
+  - `/opt/forticlientems/data/certs/<domain>.key`
+- Certbot can safely maintain the real certificate under:
+  - `/etc/letsencrypt/live/<domain>/fullchain.pem`
+  - `/etc/letsencrypt/live/<domain>/privkey.pem`
+- EMS can overwrite the deployed cert files during an EMS restart
+- the stable sequence is:
+  1. restart EMS first, if needed
+  2. wait for EMS to settle
+  3. deploy the renewed certificate last
+  4. reload Apache
 
-Always verify the live cert directly:
+That sequence was tested live and remained stable after an immediate verification and another verification about 10 minutes later.
 
-```bash
-echo | openssl s_client -connect 127.0.0.1:443 -servername ems.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
-echo | openssl s_client -connect 127.0.0.1:10443 -servername ems.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
-```
+## Important EMS Behavior
 
-## Assumptions
+EMS appears to track certificate metadata internally.
+
+On the tested system:
+
+- `fcm.public.server_certs` contained the ACME-backed certificate record
+- `fcm.public.system_settings.webserver_cert_id` and `ec_cert_id` pointed to that record
+- the stored EMS record still referenced the old expired ACME certificate
+
+Practical effect:
+
+- the GUI can show a stale warning even when Apache is serving the correct renewed cert
+- restarting EMS after deployment can cause EMS to rewrite the cert files back to the older DB-backed value
+
+Because of that, the safe automation rule is simple:
+
+**never restart EMS after certificate deployment unless you are prepared to deploy the certificate again**
+
+## Requirements
 
 - FortiClient EMS v7.4.x
 - Ubuntu 24.04
-- Apache-managed EMS frontend
-- EMS certificate files stored at:
-  - `/opt/forticlientems/data/certs/ems.example.com.crt`
-  - `/opt/forticlientems/data/certs/ems.example.com.key`
-- Cloudflare hosts the authoritative DNS for the EMS hostname
+- Cloudflare as the authoritative DNS provider
+- a Cloudflare API token with:
+  - `Zone:DNS:Edit`
+  - `Zone:Zone:Read`
 
-## Required Credentials
+Use a token scoped only to the required zone.
 
-Cloudflare API token with access limited to the target zone:
+## Runtime Paths
 
-- `Zone:DNS:Edit`
-- `Zone:Zone:Read`
+Let's Encrypt source of truth:
 
-Recommended scope: only the required zone, not all zones.
+- `/etc/letsencrypt/live/<domain>/fullchain.pem`
+- `/etc/letsencrypt/live/<domain>/privkey.pem`
 
-## Repo Layout
+EMS runtime certificate:
 
-- `scripts/setup.sh`: installs certbot and writes the deployment tooling on the EMS host
-- `scripts/reload-ems.sh`: optional reload/restart helper
-- `templates/cloudflare.ini.example`: sample Cloudflare credential file
+- `/opt/forticlientems/data/certs/<domain>.crt`
+- `/opt/forticlientems/data/certs/<domain>.key`
 
-## Install
+## Installation
 
-Copy the repo to the EMS host, then run:
+Copy this repo to the EMS host and run:
 
 ```bash
 chmod +x scripts/setup.sh scripts/reload-ems.sh
-sudo ./scripts/setup.sh \
-  --domain ems.example.com \
-  --email admin@example.com
+sudo ./scripts/setup.sh --domain ems.example.com --email admin@example.com
 ```
 
-This will:
+This installs and creates:
 
-- install `certbot` and `python3-certbot-dns-cloudflare`
-- create `/root/.secrets/certbot/cloudflare.ini`
-- create `/etc/letsencrypt/renewal-hooks/deploy/fcems-cert-deploy.sh`
-- create `/usr/local/sbin/fcems-certbot.sh`
-- enable the standard `certbot.timer`
+- `certbot`
+- `python3-certbot-dns-cloudflare`
+- `/root/.secrets/certbot/cloudflare.ini`
+- `/usr/local/sbin/fcems-certbot.sh`
+- `/usr/local/sbin/fcems-ems-refresh.sh`
+- `/etc/letsencrypt/renewal-hooks/deploy/fcems-cert-deploy.sh`
 
-## Configure Cloudflare Token
+## Cloudflare Credentials
 
-Edit the generated credential file:
+Edit the generated token file:
 
 ```bash
 sudoedit /root/.secrets/certbot/cloudflare.ini
 ```
 
-Replace `REPLACE_ME` with the real token.
+Example:
+
+```ini
+dns_cloudflare_api_token = REPLACE_ME
+```
 
 ## First Production Issue
 
-Do not use `--staging` on a live system unless you also disable deployment.
-
-Issue the first real certificate:
+Issue the certificate:
 
 ```bash
 sudo /usr/local/sbin/fcems-certbot.sh issue
 ```
 
-The wrapper uses the domain and email captured during setup.
-
-## Dry Run Renewal
+Verify the live cert:
 
 ```bash
-sudo /usr/local/sbin/fcems-certbot.sh renew-dry-run
+sudo /usr/local/sbin/fcems-certbot.sh verify
 ```
 
-This uses Let's Encrypt staging for renewal simulation, but the deploy hook in this repo explicitly refuses to deploy staging certificates into EMS.
+## Normal Renewal Flow
 
-## Optional EMS Reload / Restart
+Normal renewals do not require an EMS restart.
 
-If the EMS GUI still shows a stale warning after a successful production renewal, you can optionally reload or restart services.
-
-Lightest option:
+Use Certbot’s scheduled timer or run manually:
 
 ```bash
-sudo ./scripts/reload-ems.sh apache
+sudo /usr/local/sbin/fcems-certbot.sh renew
 ```
 
-Heavier option:
+That path:
+
+- renews through DNS-01
+- deploys the renewed cert into the EMS cert path
+- reloads Apache
+
+## Optional EMS Refresh Path
+
+If you want to refresh the EMS suite for metadata or UI reasons, use the tested safe order:
 
 ```bash
-sudo ./scripts/reload-ems.sh monitor
+sudo /usr/local/sbin/fcems-certbot.sh restart-ems-then-deploy
+sudo /usr/local/sbin/fcems-certbot.sh verify
 ```
 
-Heaviest option:
+What it does:
+
+1. restarts enabled `fcems_*` services
+2. waits for the restart burst to settle
+3. deploys the current Let's Encrypt cert into the EMS cert path
+4. reloads Apache
+
+This is the correct downtime-incurring path if you insist on an EMS restart.
+
+## Validation Commands
+
+Check the real EMS hostname on localhost:
 
 ```bash
-sudo ./scripts/reload-ems.sh all
+echo | openssl s_client -connect ems.example.com:443 -servername ems.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ```
 
-Notes:
-
-- `apache` is the recommended default and usually enough for live TLS.
-- `monitor` or `all` may help clear stale GUI metadata.
-- `all` will incur visible EMS downtime and should be treated as an operational maintenance action.
-- If the GUI warning persists while `openssl s_client` shows the correct certificate, the issue is cosmetic/UI state rather than live TLS.
-
-## Recovery If You Accidentally Deployed a Staging Cert
-
-Delete the lineage and re-issue production:
+Check the fileserver port:
 
 ```bash
-sudo certbot delete --cert-name ems.example.com
-sudo /usr/local/sbin/fcems-certbot.sh issue
-```
-
-Then verify the issuer no longer contains `(STAGING)`.
-
-## Validation Checklist
-
-```bash
-echo | openssl s_client -connect 127.0.0.1:443 -servername ems.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 echo | openssl s_client -connect 127.0.0.1:10443 -servername ems.example.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
-sudo systemctl status certbot.timer --no-pager
-sudo certbot certificates
 ```
+
+Check the deployed EMS file directly:
+
+```bash
+sudo openssl x509 -in /opt/forticlientems/data/certs/ems.example.com.crt -noout -subject -issuer -dates
+```
+
+## Recommended Admin Runbook
+
+Initial setup:
+
+```bash
+sudo ./scripts/setup.sh --domain ems.example.com --email admin@example.com
+sudoedit /root/.secrets/certbot/cloudflare.ini
+sudo /usr/local/sbin/fcems-certbot.sh issue
+sudo /usr/local/sbin/fcems-certbot.sh verify
+```
+
+Routine renewal:
+
+```bash
+sudo /usr/local/sbin/fcems-certbot.sh renew
+sudo /usr/local/sbin/fcems-certbot.sh verify
+```
+
+If you want an EMS refresh anyway:
+
+```bash
+sudo /usr/local/sbin/fcems-certbot.sh restart-ems-then-deploy
+sudo /usr/local/sbin/fcems-certbot.sh verify
+```
+
+## Repo Contents
+
+- `scripts/setup.sh`: installs the host-side automation
+- `scripts/reload-ems.sh`: standalone restart/deploy helper
+- `templates/cloudflare.ini.example`: token template
 
 ## Notes
 
-- This project is intentionally Cloudflare-only.
-- The deployed hook uses atomic temp-file replacement before reloading Apache.
-- The hook refuses to deploy Let's Encrypt staging certificates.
-- The Apache warning about `${REDHAT_ARCH}` seen on some EMS systems is noisy but not fatal for certificate deployment.
+- Cloudflare-only by design
+- Ubuntu 24.04-focused by design
+- Apache warnings about `${REDHAT_ARCH}` are noisy but harmless in this workflow
+- The normal admin path does not require any special staging workflow
